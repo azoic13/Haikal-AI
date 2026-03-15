@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import sys
 
-# --- STEP 1: SQLITE FIX FOR STREAMLIT CLOUD (MUST BE FIRST) ---
+# --- STEP 1: SQLITE FIX FOR STREAMLIT CLOUD ---
 try:
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
@@ -24,6 +24,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # --- 2. INITIAL SETUP ---
 st.set_page_config(page_title="Haikal AI", page_icon="🕌", layout="wide")
 
+# Get API Key from Secrets
 if "GEMINI_API_KEY" not in st.secrets:
     st.error("Please add 'GEMINI_API_KEY' to Streamlit Secrets.")
     st.stop()
@@ -35,7 +36,7 @@ if "messages" not in st.session_state:
 if "current_sources" not in st.session_state:
     st.session_state.current_sources = {"pdfs": [], "vids": []}
 
-# --- 3. DATABASE & ARABIC-OPTIMIZED INGESTION ---
+# --- 3. DATABASE & INGESTION ---
 embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
     model_name="paraphrase-multilingual-MiniLM-L12-v2"
 )
@@ -49,17 +50,15 @@ def load_and_ingest_db():
     )
 
     if collection.count() == 0 and os.path.exists("./knowledge"):
-        st.info("🚀 Building Knowledge Base from 1GB Library... (This takes a few minutes)")
+        st.info("🚀 Indexing 1GB Library... Please wait.")
         loader = PyPDFDirectoryLoader("./knowledge", recursive=True)
         docs = loader.load()
         
         if docs:
-            # Optimized separators for Arabic scholarly text
-            arabic_separators = ["\n\n", "\n", "。", "؟", ".", "،", " ", ""]
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=1000, 
                 chunk_overlap=150,
-                separators=arabic_separators
+                separators=["\n\n", "\n", "؟", "!", ".", "،", " ", ""]
             )
             chunks = splitter.split_documents(docs)
             
@@ -73,7 +72,7 @@ def load_and_ingest_db():
                     metadatas=[chunk.metadata for chunk in batch]
                 )
                 progress_bar.progress(min(100, int((i + batch_size) / len(chunks) * 100)))
-            st.success("✅ Library indexing complete!")
+            st.success("✅ Database Ready!")
     return collection
 
 collection = load_and_ingest_db()
@@ -89,11 +88,11 @@ def get_data(query, search_mode):
     
     if search_mode in ["Search Local Books Only", "Hybrid (Both)"]:
         try:
-            res = collection.query(query_texts=[query], n_results=4)
-            for d, m, dist in zip(res['documents'][0], res['metadatas'][0], res['distances'][0]):
-                conf = round((1 - dist) * 100)
+            # Limit results to avoid pushing the context over token limits
+            res = collection.query(query_texts=[query], n_results=3)
+            for d, m in zip(res['documents'][0], res['metadatas'][0]):
                 s_name = os.path.basename(m.get('source', 'Reference'))
-                pdf_sources.append(f"{s_name} ({conf}%)")
+                pdf_sources.append(s_name)
                 context += f"\n[SOURCE: {s_name}]\n{d}\n"
         except: pass
 
@@ -104,7 +103,7 @@ def get_data(query, search_mode):
                 try:
                     t = YouTubeTranscriptApi.get_transcript(v['id'], languages=['ar', 'en'])
                     yt_sources.append({"title": v['title'], "link": v['link']})
-                    context += f"\n[VIDEO: {v['title']}]\n{' '.join([x['text'] for x in t])[:1500]}\n"
+                    context += f"\n[VIDEO: {v['title']}]\n{' '.join([x['text'] for x in t])[:1200]}\n"
                 except: continue
         except: pass
                 
@@ -117,12 +116,16 @@ with st.sidebar:
     st.header("⚙️ Settings")
     mode = st.radio("Search Mode:", ["Search Local Books Only", "Ask Mostafa Al-Adawi", "Hybrid (Both)"], index=2)
     st.divider()
-    
+    if st.button("🗑️ Clear Chat"):
+        st.session_state.messages = []
+        st.rerun()
+
+# Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-if prompt := st.chat_input("Ask in any language..."):
+if prompt := st.chat_input("Ask a question..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"): st.markdown(prompt)
 
@@ -131,18 +134,19 @@ if prompt := st.chat_input("Ask in any language..."):
             context, pdfs, vids = get_data(prompt, mode)
             st.session_state.current_sources = {"pdfs": pdfs, "vids": vids}
             
-            # THE CRITICAL FIX: System Instruction for Language Matching
+            # --- UPDATED GENERATION WITH STABLE 2.5 FREE TIER ---
             sys_instruct = (
                 "You are the official scholarly assistant for Sheikh Mostafa Al-Adawi. "
-                "CRITICAL: Always reply in the same language as the user. If they ask in Arabic, "
-                "you MUST reply in Arabic. If they ask in English, reply in English. "
-                "Cite your sources precisely from the provided context."
+                "CRITICAL: Always reply in the same language as the user's prompt. "
+                "If they ask in Arabic, reply in Arabic. If in English, reply in English. "
+                "Use the provided context to cite your answers."
             )
             
             try:
+                # 'gemini-2.5-flash' is the stable free-tier model in 2026
                 response = client_gemini.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=f"Context:\n{context}\n\nQuestion: {prompt}",
+                    model="gemini-2.5-flash",
+                    contents=f"Context:\n{context}\n\nUser Question: {prompt}",
                     config=types.GenerateContentConfig(
                         system_instruction=sys_instruct,
                         temperature=0.3
@@ -150,15 +154,26 @@ if prompt := st.chat_input("Ask in any language..."):
                 )
                 answer = response.text
             except Exception as e:
-                st.error("Model Error: Try checking your API key permissions.")
-                answer = f"Error details: {str(e)}"
+                # Fallback to Lite model if standard Flash is exhausted
+                try:
+                    response = client_gemini.models.generate_content(
+                        model="gemini-2.5-flash-lite",
+                        contents=f"Context:\n{context}\n\nUser Question: {prompt}",
+                        config=types.GenerateContentConfig(
+                            system_instruction=sys_instruct,
+                            temperature=0.3
+                        )
+                    )
+                    answer = response.text
+                except:
+                    answer = f"⚠️ Quota Exceeded. Please wait 60 seconds and try again.\n\nError: {str(e)}"
             
             st.markdown(answer)
             st.session_state.messages.append({"role": "assistant", "content": answer})
             st.rerun()
 
-# Sidebar Source Updates
+# Sidebar Sources
 with st.sidebar:
-    st.subheader("📍 Sources Found:")
+    st.subheader("📚 Sources Found:")
     for p in set(st.session_state.current_sources["pdfs"]): st.write(f"📖 {p}")
     for v in st.session_state.current_sources["vids"]: st.markdown(f"🎥 [{v['title']}]({v['link']})")
