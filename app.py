@@ -126,7 +126,7 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
         st.caption("Admin: Add ?analytics=on to URL. Pass: haikal2026")
 
     # --- 4. MAIN CHAT INTERFACE ---
-    st.title("🕌 Sharee'a AI (by Haikal)")
+    st.title("🕌 Sharee'a AI (شريعة)")
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
