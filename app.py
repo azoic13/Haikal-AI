@@ -7,7 +7,7 @@ except ImportError:
     pass 
 
 import streamlit as st
-import streamlit_analytics2 as streamlit_analytics # Analytics Import
+import streamlit_analytics2 as streamlit_analytics
 import chromadb
 from chromadb.utils import embedding_functions
 from youtubesearchpython import VideosSearch
@@ -20,8 +20,8 @@ from bidi.algorithm import get_display
 import os
 
 # --- 1. INITIAL SETUP & ANALYTICS WRAPPER ---
-# This starts tracking everything inside the 'with' block
-with streamlit_analytics.track(save_to_json="./analytics.json"):
+# Everything below this 'with' statement is indented by 4 spaces
+with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password="haikal2026"):
 
     st.set_page_config(page_title="Sharee'a AI (by Haikal)", page_icon="🕌", layout="wide")
 
@@ -123,7 +123,7 @@ with streamlit_analytics.track(save_to_json="./analytics.json"):
                 st.markdown(f"🎥 [{v['title']}]({v['link']})")
         
         st.divider()
-        st.caption("Admin: Add ?analytics=on to URL to view stats.")
+        st.caption("Admin: Add ?analytics=on to URL. Pass: haikal2026")
 
     # --- 4. MAIN CHAT INTERFACE ---
     st.title("🕌 Sharee'a AI (by Haikal)")
@@ -165,8 +165,3 @@ with streamlit_analytics.track(save_to_json="./analytics.json"):
                 except: pass
                 
                 st.rerun()
-
-                    # --- 5. SECURE ANALYTICS PASSWORD ---
-                    # To view: your-url.streamlit.app/?analytics=on
-                 # --- UPDATE THE TOP OF YOUR SCRIPT TO THIS ---
-                with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password="haikal2026"):
