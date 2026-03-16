@@ -1,4 +1,4 @@
-# --- STEP 0: THE SQLITE FIX (MUST BE AT THE VERY TOP) ---
+# --- STEP 0: THE SQLITE FIX ---
 import sys
 try:
     __import__('pysqlite3')
@@ -32,6 +32,7 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
 
     client_gemini = genai.Client(api_key=API_KEY)
 
+    # Persistent State
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "current_pdfs" not in st.session_state:
@@ -72,18 +73,16 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
         yt_context, yt_sources = "", [] 
         CHANNELS = ["@ftawamostafaaladwy", "@fatawa_eladawy"]
 
-        # 1. Search Local Books First
         if search_mode in ["Search Books Only", "Hybrid (Both)"]:
             try:
-                # Increased n_results to 5 to find more possible viewpoints
                 results = collection.query(query_texts=[query], n_results=5)
-                for d, m in zip(results['documents'][0], results['metadatas'][0]):
-                    s_name = m.get('source', 'Unknown Book')
-                    pdf_sources.append(s_name)
-                    pdf_context += f"SOURCE (BOOK): {s_name}\nTEXT: {d}\n---\n"
+                if results['documents'] and len(results['documents'][0]) > 0:
+                    for d, m in zip(results['documents'][0], results['metadatas'][0]):
+                        s_name = m.get('source', 'Unknown Book')
+                        pdf_sources.append(s_name)
+                        pdf_context += f"SOURCE (BOOK): {s_name}\nTEXT: {d}\n---\n"
             except Exception: pass
 
-        # 2. Search YouTube Path Second
         if search_mode in ["Ask Mostafa Al-Adawi", "Hybrid (Both)"]:
             for handle in CHANNELS:
                 try:
@@ -101,9 +100,19 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
                     
         return pdf_context, yt_context, pdf_sources, yt_sources
 
-    # --- 3. SIDEBAR ---
+    # --- 3. SIDEBAR (FIXED DISPLAY) ---
     with st.sidebar:
         st.title("⚙️ Control Room")
+        
+        # Monitor DB status
+        try:
+            count = collection.count()
+            st.metric("Library Size (Chunks)", count)
+            if count == 0:
+                st.warning("⚠️ Database is empty! Check your 'my_db' folder.")
+        except:
+            st.error("Could not connect to database.")
+            
         mode = st.radio("Search Mode:", ["Search Books Only", "Ask Mostafa Al-Adawi", "Hybrid (Both)"], index=2)
         
         if st.button("🗑️ Clear Chat History"):
@@ -112,8 +121,22 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
             st.session_state.current_vids = []
             st.rerun()
 
+        st.divider()
+        st.subheader("📍 Sources Consulted:")
+        
+        # ALWAYS RENDER FROM SESSION STATE
+        if st.session_state.current_pdfs:
+            st.markdown("**From Books:**")
+            for p in set(st.session_state.current_pdfs):
+                st.write(f"📖 {p}")
+        
+        if st.session_state.current_vids:
+            st.markdown("**From Videos:**")
+            for v in st.session_state.current_vids:
+                st.markdown(f"🎥 [{v['title']}]({v['link']})")
+
     # --- 4. MAIN CHAT INTERFACE ---
-    st.title("🕌 Sharee'a AI (شريعة)")
+    st.title("🕌 Sharee'a AI (by Haikal)")
 
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
@@ -125,42 +148,44 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Prioritizing local books, then searching videos..."):
-                pdf_context, yt_context, pdf_s, vid_s = get_data(prompt, mode)
+            with st.spinner("Searching files then videos..."):
+                pdf_ctx, yt_ctx, pdf_s, vid_s = get_data(prompt, mode)
+                
+                # Save to session state so sidebar can find it after rerun
                 st.session_state.current_pdfs = pdf_s
                 st.session_state.current_vids = vid_s
                 
-                # REFINED SYSTEM INSTRUCTION
                 system_instr = """
                 You are a scholarly research assistant.
-                REQUIRED STRUCTURE:
-                1. Start with 'Answers from Books:' and list all different perspectives found in the provided BOOK context. Mention the book name for each.
-                2. Then follow with 'Answers from Sheikh Mostafa Al-Adawi (Videos):' and provide his views from the VIDEO context.
-                3. If there are multiple different answers for the same question, list them all clearly.
-                4. Maintain a 'Confidence Score' at the end.
-                5. Match the user's language (Arabic or English).
+                
+                PRIORITY ORDER:
+                1. Start your answer with 'Answers from Books:'. List all findings from the BOOK context, citing the file name for each.
+                2. Then provide 'Answers from Sheikh Mostafa Al-Adawi (Videos):' based on the VIDEO context.
+                3. If multiple answers exist, show them all.
+                4. Match the user's language.
                 """
 
                 try:
-                    full_context = f"BOOK CONTEXT:\n{pdf_context}\n\nVIDEO CONTEXT:\n{yt_context}"
+                    combined_input = f"BOOK CONTEXT:\n{pdf_ctx}\n\nVIDEO CONTEXT:\n{yt_ctx}\n\nUSER QUESTION: {prompt}"
                     response = client_gemini.models.generate_content(
                         model="gemini-3.1-flash-lite-preview",
-                        contents=f"USER QUESTION: {prompt}\n\n{full_context}",
+                        contents=combined_input,
                         config=types.GenerateContentConfig(
                             system_instruction=system_instr,
-                            temperature=0.2
+                            temperature=0.3
                         )
                     )
                     answer_text = response.text
                 except Exception as e:
-                    answer_text = f"I encountered an error: {str(e)}"
+                    answer_text = f"Error: {str(e)}"
                 
                 st.markdown(answer_text)
                 st.session_state.messages.append({"role": "assistant", "content": answer_text})
                 
+                # Optional: Show PDF button
                 try:
                     pdf_bytes = create_pdf(prompt, answer_text)
-                    st.download_button(label="📥 Save PDF", data=pdf_bytes, file_name="Fatwa_Report.pdf", mime="application/pdf")
+                    st.download_button(label="📥 Save PDF", data=pdf_bytes, file_name="Report.pdf", mime="application/pdf")
                 except: pass
                 
                 st.rerun()
