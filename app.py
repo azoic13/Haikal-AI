@@ -20,12 +20,10 @@ from bidi.algorithm import get_display
 import os
 
 # --- 1. INITIAL SETUP & ANALYTICS WRAPPER ---
-# Everything below this 'with' statement is indented by 4 spaces
 with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password="haikal2026"):
 
     st.set_page_config(page_title="Sharee'a (شريعة) AI", page_icon="🕌", layout="wide")
 
-    # SECURITY FIX: Use secrets instead of hardcoding
     if "GEMINI_API_KEY" in st.secrets:
         API_KEY = st.secrets["GEMINI_API_KEY"]
     else:
@@ -34,7 +32,6 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
 
     client_gemini = genai.Client(api_key=API_KEY)
 
-    # Initialize Session State
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "current_pdfs" not in st.session_state:
@@ -46,7 +43,6 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
         model_name="paraphrase-multilingual-MiniLM-L12-v2"
     )
 
-    # PERSISTENCE FIX
     db_path = "./my_db"
     client_db = chromadb.PersistentClient(path=db_path)
     collection = client_db.get_or_create_collection(name="religious_knowledge", embedding_function=embedding_func)
@@ -76,15 +72,17 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
         yt_context, yt_sources = "", [] 
         CHANNELS = ["@ftawamostafaaladwy", "@fatawa_eladawy"]
 
+        # 1. Start with Local Files (Prioritized)
         if search_mode in ["Search Books Only", "Hybrid (Both)"]:
             try:
-                results = collection.query(query_texts=[query], n_results=3)
+                results = collection.query(query_texts=[query], n_results=4)
                 for d, m in zip(results['documents'][0], results['metadatas'][0]):
                     s_name = m.get('source', 'Unknown Book')
                     pdf_sources.append(s_name)
-                    pdf_context += f"\n[BOOK SOURCE: {s_name}]\n{d}\n"
+                    pdf_context += f"\n[LOCAL FILE: {s_name}]\n{d}\n"
             except Exception: pass
 
+        # 2. Go to YouTube Path
         if search_mode in ["Ask Mostafa Al-Adawi", "Hybrid (Both)"]:
             for handle in CHANNELS:
                 try:
@@ -96,11 +94,11 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
                             v_title = str(v['title'])
                             v_link = str(v['link'])
                             yt_sources.append({"title": v_title, "link": v_link})
-                            yt_context += f"\n[VIDEO SOURCE: {v_title}]\nLink: {v_link}\nTranscript: {' '.join([x['text'] for x in t])[:2000]}\n"
+                            yt_context += f"\n[YOUTUBE VIDEO: {v_title}]\nTranscript: {' '.join([x['text'] for x in t])[:1500]}\n"
                         except: continue
                 except Exception: continue
                     
-        return pdf_context + yt_context, pdf_sources, yt_sources
+        return pdf_context, yt_context, pdf_sources, yt_sources
 
     # --- 3. SIDEBAR ---
     with st.sidebar:
@@ -138,17 +136,28 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Searching sources..."):
-                context, pdfs, vids = get_data(prompt, mode)
+            with st.spinner("Analyzing files then videos..."):
+                pdf_ctx, yt_ctx, pdfs, vids = get_data(prompt, mode)
                 st.session_state.current_pdfs = pdfs
                 st.session_state.current_vids = vids
                 
+                # REFINED LOGIC INSTRUCTIONS
+                instr = (
+                    "You are a scholarly assistant. Follow these rules strictly:\n"
+                    "1. START the answer with findings from the 'LOCAL FILE' context. Cite the file name.\n"
+                    "2. FOLLOW with views from 'YOUTUBE VIDEO' (Sheikh Mostafa Al-Adawi).\n"
+                    "3. If there is more than one possible answer or viewpoint, show ALL of them clearly.\n"
+                    "4. State the source for every viewpoint mentioned.\n"
+                    "5. End with a Confidence Score and match the user's language."
+                )
+                
                 try:
+                    full_context = f"--- LOCAL FILES DATA ---\n{pdf_ctx}\n\n--- YOUTUBE DATA ---\n{yt_ctx}"
                     response = client_gemini.models.generate_content(
                         model="gemini-3.1-flash-lite-preview",
-                        contents=f"CONTEXT:\n{context}\n\nQ: {prompt}",
+                        contents=f"CONTEXT:\n{full_context}\n\nQUESTION: {prompt}",
                         config=types.GenerateContentConfig(
-                            system_instruction="You are an expert assistant for Sheikh Mostafa Al-Adawi. 1. Confidence Score. 2. Cite titles. 3. Match the user's language.",
+                            system_instruction=instr,
                             temperature=0.3
                         )
                     )
