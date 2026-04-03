@@ -18,130 +18,163 @@ from fpdf import FPDF
 import arabic_reshaper
 from bidi.algorithm import get_display
 import os
+import zipfile
+import pathlib
 
-# --- CONSTANTS ---
+# ---------------------------------------------------------------------------
+# STEP 1 — RESOLVE PATHS RELATIVE TO THIS FILE
+# Works correctly locally AND on Streamlit Cloud no matter the CWD.
+# ---------------------------------------------------------------------------
+BASE_DIR = pathlib.Path(__file__).parent.resolve()
+
+# ---------------------------------------------------------------------------
+# STEP 2 — EXTRACT my_db.zip ON FIRST RUN
+# Streamlit Cloud's repo filesystem is read-only, so we extract into /tmp
+# which is always writable. On subsequent runs the folder already exists
+# so this block is skipped (fast).
+# ---------------------------------------------------------------------------
+DB_ZIP    = BASE_DIR / "my_db.zip"
+DB_FOLDER = pathlib.Path("/tmp/my_db")   # writable on every platform
+
+if not DB_FOLDER.exists():
+    if DB_ZIP.exists():
+        with zipfile.ZipFile(DB_ZIP, "r") as zf:
+            zf.extractall("/tmp")         # produces /tmp/my_db/
+    else:
+        # No zip present — ChromaDB will just create an empty collection.
+        DB_FOLDER.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# CONSTANTS — single source of truth for mode label strings.
+# The radio widget and get_data() both reference these, so they can never
+# drift out of sync (that was the original search bug).
+# ---------------------------------------------------------------------------
 MODE_BOOKS   = "Search Hadith Books (كتب الاحاديث و التفسير) Only"
 MODE_YOUTUBE = "Mostafa Al-Adawi Youtube Channel"
 MODE_HYBRID  = "Hybrid (Both)"
 
-# --- 1. INITIAL SETUP & ANALYTICS WRAPPER ---
-with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password="haikal2026"):
-
+# ---------------------------------------------------------------------------
+# MAIN APP — wrapped in analytics tracker
+# ---------------------------------------------------------------------------
+with streamlit_analytics.track(
+    save_to_json=str(BASE_DIR / "analytics.json"),
+    unsafe_password="haikal2026"
+):
     st.set_page_config(page_title="Sharee'a (شريعة) AI", page_icon="🕌", layout="wide")
 
-    # SECURITY: Use secrets instead of hardcoding
-    if "GEMINI_API_KEY" in st.secrets:
-        API_KEY = st.secrets["GEMINI_API_KEY"]
-    else:
+    # ── API key ──────────────────────────────────────────────────────────────
+    if "GEMINI_API_KEY" not in st.secrets:
         st.error("Please add GEMINI_API_KEY to your Streamlit Secrets.")
         st.stop()
 
-    client_gemini = genai.Client(api_key=API_KEY)
+    client_gemini = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
-    # Initialize Session State
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "current_pdfs" not in st.session_state:
-        st.session_state.current_pdfs = []
-    if "current_vids" not in st.session_state:
-        st.session_state.current_vids = []
+    # ── Session state ────────────────────────────────────────────────────────
+    if "messages"     not in st.session_state: st.session_state.messages      = []
+    if "current_pdfs" not in st.session_state: st.session_state.current_pdfs  = []
+    if "current_vids" not in st.session_state: st.session_state.current_vids  = []
 
+    # ── ChromaDB ─────────────────────────────────────────────────────────────
     embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="paraphrase-multilingual-MiniLM-L12-v2"
     )
-
-    # PERSISTENCE
-    db_path = "./my_db"
-    client_db = chromadb.PersistentClient(path=db_path)
+    # Use /tmp/my_db — writable on Streamlit Cloud
+    client_db  = chromadb.PersistentClient(path=str(DB_FOLDER))
     collection = client_db.get_or_create_collection(
         name="religious_knowledge",
         embedding_function=embedding_func
     )
 
-    # --- 2. CORE FUNCTIONS ---
+    # ── Font path (arial.ttf ships in the repo) ──────────────────────────────
+    FONT_PATH = BASE_DIR / "arial.ttf"
 
-    def fix_arabic_for_pdf(text):
+    # =========================================================================
+    # HELPER FUNCTIONS
+    # =========================================================================
+
+    def fix_arabic_for_pdf(text: str) -> str:
+        """Reshape + apply BiDi so Arabic renders correctly in fpdf."""
         if not text:
             return ""
-        reshaped_text = arabic_reshaper.reshape(text)
-        return get_display(reshaped_text)
+        return get_display(arabic_reshaper.reshape(text))
 
-    def create_pdf(question, answer):
+    def create_pdf(question: str, answer: str) -> bytes:
         pdf = FPDF()
         pdf.add_page()
-        if os.path.exists("arial.ttf"):
-            pdf.add_font("ArialAR", "", "arial.ttf")
+        if FONT_PATH.exists():
+            pdf.add_font("ArialAR", "", str(FONT_PATH))
             pdf.set_font("ArialAR", size=12)
         else:
             pdf.set_font("Helvetica", size=12)
-        pdf.multi_cell(0, 10, txt=fix_arabic_for_pdf(f"السؤال: {question}"), align='R')
+        pdf.multi_cell(0, 10, txt=fix_arabic_for_pdf(f"السؤال: {question}"), align="R")
         pdf.ln(5)
-        pdf.multi_cell(0, 10, txt=fix_arabic_for_pdf(f"الإجابة:\n{answer}"), align='R')
+        pdf.multi_cell(0, 10, txt=fix_arabic_for_pdf(f"الإجابة:\n{answer}"), align="R")
         return pdf.output()
 
-    def get_data(query, search_mode):
+    def get_data(query: str, search_mode: str):
         """
-        Fetches context from ChromaDB (books) and/or YouTube transcripts
-        depending on the selected search mode.
+        Returns (combined_context, pdf_sources, yt_sources).
+        Fetches from ChromaDB books and/or YouTube depending on search_mode.
         """
         pdf_context, pdf_sources = "", []
         yt_context,  yt_sources  = "", []
         CHANNELS = ["@ftawamostafaaladwy", "@fatawa_eladawy"]
 
-        # ── Book search ──────────────────────────────────────────────────────
+        # ── Book / ChromaDB search ───────────────────────────────────────────
         if search_mode in [MODE_BOOKS, MODE_HYBRID]:
             try:
                 results = collection.query(query_texts=[query], n_results=3)
-                if results and results.get("documents"):
-                    for d, m in zip(results["documents"][0], results["metadatas"][0]):
-                        s_name = m.get("source", "Unknown Book")
-                        pdf_sources.append(s_name)
-                        pdf_context += f"\n[BOOK SOURCE: {s_name}]\n{d}\n"
-                if not pdf_context:
-                    st.warning("⚠️ No results found in the book database. Make sure books have been ingested.")
+                if results and results.get("documents") and results["documents"][0]:
+                    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+                        source = meta.get("source", "Unknown Book")
+                        pdf_sources.append(source)
+                        pdf_context += f"\n[BOOK SOURCE: {source}]\n{doc}\n"
+                else:
+                    st.warning("⚠️ No results in book database. Make sure books have been ingested.")
             except Exception as e:
                 st.warning(f"⚠️ Book search error: {e}")
 
         # ── YouTube search ───────────────────────────────────────────────────
-        # FIX: mode string now matches the radio button label exactly
+        # NOTE: search_mode string now matches the radio label exactly (was the bug)
         if search_mode in [MODE_YOUTUBE, MODE_HYBRID]:
             found_any = False
             for handle in CHANNELS:
                 try:
-                    search = VideosSearch(f"{query} {handle}", limit=2)
-                    res = search.result().get("result", [])
-                    for v in res:
+                    search_result = VideosSearch(f"{query} {handle}", limit=2)
+                    videos = search_result.result().get("result", [])
+                    for v in videos:
                         try:
                             transcript = YouTubeTranscriptApi.get_transcript(
                                 v["id"], languages=["ar", "en"]
                             )
-                            v_title = str(v["title"])
-                            v_link  = str(v["link"])
-                            yt_sources.append({"title": v_title, "link": v_link})
-                            transcript_text = " ".join([x["text"] for x in transcript])[:2000]
+                            title = str(v["title"])
+                            link  = str(v["link"])
+                            yt_sources.append({"title": title, "link": link})
+                            transcript_text = " ".join(x["text"] for x in transcript)[:2000]
                             yt_context += (
-                                f"\n[VIDEO SOURCE: {v_title}]\n"
-                                f"Link: {v_link}\n"
+                                f"\n[VIDEO SOURCE: {title}]\n"
+                                f"Link: {link}\n"
                                 f"Transcript: {transcript_text}\n"
                             )
                             found_any = True
                         except Exception as e:
-                            st.warning(f"⚠️ Could not fetch transcript for '{v.get('title', 'unknown')}': {e}")
-                            continue
+                            st.warning(
+                                f"⚠️ Transcript unavailable for '{v.get('title', 'unknown')}': {e}"
+                            )
                 except Exception as e:
-                    st.warning(f"⚠️ YouTube search error for channel {handle}: {e}")
-                    continue
+                    st.warning(f"⚠️ YouTube search error ({handle}): {e}")
 
             if not found_any:
-                st.warning("⚠️ No YouTube transcripts could be retrieved.")
+                st.warning("⚠️ No YouTube transcripts could be retrieved for this query.")
 
         return pdf_context + yt_context, pdf_sources, yt_sources
 
-    # --- 3. SIDEBAR ---
+    # =========================================================================
+    # SIDEBAR
+    # =========================================================================
     with st.sidebar:
         st.title("⚙️ Control Room")
 
-        # All three strings here are now the single source of truth (use constants)
         mode = st.radio(
             "Search Mode:",
             [MODE_BOOKS, MODE_YOUTUBE, MODE_HYBRID],
@@ -149,24 +182,24 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
         )
 
         if st.button("🗑️ Clear Chat History"):
-            st.session_state.messages    = []
+            st.session_state.messages     = []
             st.session_state.current_pdfs = []
             st.session_state.current_vids = []
             st.rerun()
 
         st.divider()
         st.subheader("📍 Sources Consulted:")
-        if st.session_state.current_pdfs:
-            for p in set(st.session_state.current_pdfs):
-                st.write(f"📖 {p}")
-        if st.session_state.current_vids:
-            for v in st.session_state.current_vids:
-                st.markdown(f"🎥 [{v['title']}]({v['link']})")
+        for p in set(st.session_state.current_pdfs):
+            st.write(f"📖 {p}")
+        for v in st.session_state.current_vids:
+            st.markdown(f"🎥 [{v['title']}]({v['link']})")
 
         st.divider()
         st.caption("Admin: Add ?analytics=on to URL. Pass: haikal2026")
 
-    # --- 4. MAIN CHAT INTERFACE ---
+    # =========================================================================
+    # MAIN CHAT INTERFACE
+    # =========================================================================
     st.title("🕌 Sharee'a AI (شريعة)")
 
     for msg in st.session_state.messages:
@@ -184,10 +217,10 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
                 st.session_state.current_pdfs = pdfs
                 st.session_state.current_vids = vids
 
+                # ── Gemini call ──────────────────────────────────────────────
                 try:
                     response = client_gemini.models.generate_content(
-                        # FIX: use a real, available Gemini model name
-                        model="gemini-2.0-flash",
+                        model="gemini-2.0-flash",   # FIX: was a non-existent model name
                         contents=f"CONTEXT:\n{context}\n\nQ: {prompt}",
                         config=types.GenerateContentConfig(
                             system_instruction=(
@@ -197,28 +230,28 @@ with streamlit_analytics.track(save_to_json="./analytics.json", unsafe_password=
                                 "2) Cite the source titles you used. "
                                 "3) Reply in the same language the user used."
                             ),
-                            temperature=0.3
-                        )
+                            temperature=0.3,
+                        ),
                     )
                     answer_text = response.text
                 except Exception as e:
-                    answer_text = f"❌ Gemini API error: {str(e)}"
+                    answer_text = f"❌ Gemini API error: {e}"
 
                 st.markdown(answer_text)
                 st.session_state.messages.append({"role": "assistant", "content": answer_text})
 
-                # PDF download — fail silently but log to console
+                # ── PDF download ─────────────────────────────────────────────
                 try:
                     pdf_bytes = create_pdf(prompt, answer_text)
                     st.download_button(
                         label="📥 Save as PDF",
                         data=pdf_bytes,
                         file_name="Sharee'a_Report.pdf",
-                        mime="application/pdf"
+                        mime="application/pdf",
                     )
                 except Exception as e:
                     print(f"PDF generation error: {e}")
 
-                # FIX: removed st.rerun() — Streamlit reruns automatically after
-                # chat input; calling it manually here caused UI flicker and
-                # could interrupt the assistant message render.
+                # NOTE: st.rerun() intentionally removed — Streamlit reruns
+                # automatically after st.chat_input; the explicit call was
+                # causing UI flicker and could cut off the assistant message.
